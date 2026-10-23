@@ -48,12 +48,46 @@ export class RolesService {
     });
   }
 
-  async getRoleById(id: string, actor: RoleActor) {
+  /**
+   * Central tenant-isolation check. Out-of-scope access is reported as
+   * ROLE_NOT_FOUND so the existence of other tenants' roles is never revealed.
+   * GLOBAL roles are read-only for tenant admins (write attempts →
+   * ROLE_SCOPE_VIOLATION). SUPER_ADMIN is exempt from every restriction.
+   */
+  private assertRoleAccessible(
+    role: { scopeType?: RoleScope; zoneId?: string | null; companyId?: string | null },
+    actor: RoleActor,
+    { write }: { write?: boolean } = {},
+  ): void {
+    if (actor.role === UserRole.SUPER_ADMIN) return;
+
+    if (actor.role !== UserRole.ZONE_MANAGER && actor.role !== UserRole.COMPANY_ADMIN) {
+      // No other roles may use this service.
+      throw new AppException('ROLE_NOT_FOUND');
+    }
+
+    const readable =
+      (actor.role === UserRole.ZONE_MANAGER &&
+        (role.scopeType === RoleScope.GLOBAL ||
+          (role.scopeType === RoleScope.ZONE && role.zoneId === actor.zoneId))) ||
+      (actor.role === UserRole.COMPANY_ADMIN &&
+        (role.scopeType === RoleScope.GLOBAL ||
+          (role.scopeType === RoleScope.COMPANY && role.companyId === actor.companyId)));
+
+    if (!readable) throw new AppException('ROLE_NOT_FOUND');
+
+    if (write && role.scopeType === RoleScope.GLOBAL) {
+      throw new AppException('ROLE_SCOPE_VIOLATION');
+    }
+  }
+
+  async getRoleById(id: string, actor: RoleActor, { write }: { write?: boolean } = {}) {
     const role = await this.prisma.role.findUnique({
       where: { id },
       include: { permissions: { select: { permission: true } } },
     });
     if (!role) throw new AppException('ROLE_NOT_FOUND');
+    this.assertRoleAccessible(role, actor, { write });
     return role;
   }
 
@@ -101,7 +135,7 @@ export class RolesService {
   }
 
   async updateRole(id: string, dto: UpdateRoleDto, actor: RoleActor) {
-    const role = await this.getRoleById(id, actor);
+    const role = await this.getRoleById(id, actor, { write: true });
     if (role.isSystem && dto.name && dto.name !== role.name) {
       throw new AppException('ROLE_IS_SYSTEM');
     }
@@ -127,7 +161,7 @@ export class RolesService {
   }
 
   async deleteRole(id: string, actor: RoleActor) {
-    const role = await this.getRoleById(id, actor);
+    const role = await this.getRoleById(id, actor, { write: true });
     if (role.isSystem) throw new AppException('ROLE_IS_SYSTEM');
 
     await this.prisma.$transaction([
@@ -151,7 +185,15 @@ export class RolesService {
   }
 
   async setRolePermissions(id: string, permissions: string[], actor: RoleActor) {
-    const role = await this.getRoleById(id, actor);
+    const role = await this.getRoleById(id, actor, { write: true });
+
+    // Tenant admins may never attach permissions beyond their own authority;
+    // the submitted list must be a subset of the actor's effective set.
+    if (actor.role !== UserRole.SUPER_ADMIN) {
+      const ownPermissions = new Set(await this.permissionsService.getUserPermissions(actor.userId));
+      const beyondAuthority = permissions.filter((p) => !ownPermissions.has(p));
+      if (beyondAuthority.length > 0) throw new AppException('ROLE_SCOPE_VIOLATION');
+    }
 
     const assigned = await this.prisma.roleAssignment.findMany({
       where: { roleId: id },
@@ -183,7 +225,7 @@ export class RolesService {
   }
 
   async assignRole(roleId: string, userId: string, actor: RoleActor) {
-    const role = await this.getRoleById(roleId, actor);
+    const role = await this.getRoleById(roleId, actor, { write: true });
 
     const targetUser = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!targetUser || targetUser.deletedAt) throw new AppException('USER_NOT_FOUND');
@@ -197,6 +239,16 @@ export class RolesService {
       }
       if (targetUser.role === UserRole.SUPER_ADMIN) {
         throw new AppException('USER_PERMISSION_DENIED');
+      }
+      // Cross-tenant assignment guard: the target user must belong to the
+      // administrative scope of the role being assigned (defense-in-depth —
+      // roles of other tenants can no longer be resolved, so this matches
+      // reachability of the current actor's tenants only).
+      if (
+        (role.scopeType === RoleScope.ZONE && role.zoneId !== targetUser.zoneId) ||
+        (role.scopeType === RoleScope.COMPANY && role.companyId !== targetUser.companyId)
+      ) {
+        throw new AppException('USER_TARGET_OUT_OF_SCOPE');
       }
     }
 
@@ -223,7 +275,7 @@ export class RolesService {
   }
 
   async unassignRole(roleId: string, userId: string, actor: RoleActor) {
-    const role = await this.getRoleById(roleId, actor);
+    const role = await this.getRoleById(roleId, actor, { write: true });
 
     await this.prisma.roleAssignment.deleteMany({ where: { userId, roleId } });
 
